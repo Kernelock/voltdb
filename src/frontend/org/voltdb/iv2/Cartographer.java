@@ -48,6 +48,7 @@ import org.voltcore.zk.CoreZK;
 import org.voltcore.zk.LeaderElector;
 import org.voltcore.zk.ZKUtil;
 import org.voltdb.AbstractTopology;
+import org.voltdb.ClientInterface;
 import org.voltdb.MailboxNodeContent;
 import org.voltdb.StatsSource;
 import org.voltdb.VoltDB;
@@ -56,6 +57,8 @@ import org.voltdb.VoltTable.ColumnInfo;
 import org.voltdb.VoltType;
 import org.voltdb.VoltZK;
 import org.voltdb.VoltZK.MailboxType;
+import org.voltdb.client.BatchTimeoutOverrideType;
+import org.voltdb.client.SyncCallback;
 import org.voltdb.iv2.LeaderCache.LeaderCallBackInfo;
 import com.google_voltpatches.common.base.Preconditions;
 import com.google_voltpatches.common.collect.ArrayListMultimap;
@@ -84,6 +87,7 @@ public class Cartographer extends StatsSource
 
     public static final String JSON_PARTITION_ID = "partitionId";
     public static final String JSON_INITIATOR_HSID = "initiatorHSId";
+    public static final String JSON_LEADER_MIGRATION = "leaderMigration";
 
     private final int m_configuredReplicationFactor;
     //partition masters by host
@@ -97,10 +101,6 @@ public class Cartographer extends StatsSource
     // local client interface so we can keep the CIs implementation
     private void sendLeaderChangeNotify(long hsId, int partitionId, boolean migratePartitionLeader)
     {
-        //do not notify the leader change because of MigratePartitionLeader to avoid intentional transaction drop
-        if (migratePartitionLeader) {
-            return;
-        }
         hostLog.info("[Cartographer] Sending leader change notification with new leader:" +
                 CoreUtils.hsIdToString(hsId) + " for partition:" + partitionId);
 
@@ -109,6 +109,7 @@ public class Cartographer extends StatsSource
             stringer.object();
             stringer.keySymbolValuePair(JSON_PARTITION_ID, partitionId);
             stringer.keySymbolValuePair(JSON_INITIATOR_HSID, hsId);
+            stringer.keySymbolValuePair(JSON_LEADER_MIGRATION, migratePartitionLeader);
             stringer.endObject();
             BinaryPayloadMessage bpm = new BinaryPayloadMessage(new byte[0], stringer.toString().getBytes("UTF-8"));
             int hostId = m_hostMessenger.getHostId();
