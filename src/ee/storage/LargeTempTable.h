@@ -139,6 +139,23 @@ public:
         throwSerializableEEException("swapContents not supported on large temp tables");
     }
 
+    std::vector<int64_t>& getBlockIds() {
+        return m_blockIds;
+    }
+
+    std::vector<int64_t>::iterator disownBlock(std::vector<int64_t>::iterator pos) {
+        LargeTempTableBlockCache* lttBlockCache = ExecutorContext::getExecutorContext()->lttBlockCache();
+        m_tupleCount -= lttBlockCache->getBlockTupleCount(*pos);
+        return m_blockIds.erase(pos);
+    }
+
+    void inheritBlock(int64_t blockId) {
+        LargeTempTableBlockCache* lttBlockCache = ExecutorContext::getExecutorContext()->lttBlockCache();
+        m_tupleCount += lttBlockCache->getBlockTupleCount(blockId);
+        m_blockIds.push_back(blockId);
+
+    }
+
 protected:
 
     LargeTempTable();

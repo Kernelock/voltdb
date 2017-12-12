@@ -34,13 +34,18 @@
 #include "common/tabletuple.h"
 #include "common/TupleSchema.h"
 #include "common/TupleSchemaBuilder.h"
+
 #include "storage/LargeTempTableBlock.h"
+#include "storage/LargeTempTable.h"
+#include "storage/tablefactory.h"
 
 #include "harness.h"
 
-#include "test_utils/UniqueEngine.hpp"
+#include "test_utils/LargeTempTableTopend.hpp"
 #include "test_utils/Tools.hpp"
 #include "test_utils/TupleComparingTest.hpp"
+#include "test_utils/UniqueEngine.hpp"
+#include "test_utils/UniqueTable.hpp"
 
 using namespace voltdb;
 
@@ -104,8 +109,6 @@ protected:
         std::cout << "    -->  Time per sort: " << millisPerSort << " ms\n\n";
     }
 
-private:
-
     std::string generateRandomString(std::size_t length) {
         std::ostringstream oss;
         while (oss.str().length() < length) {
@@ -114,6 +117,9 @@ private:
 
         return oss.str().substr(0, length);
     }
+
+
+private:
 
     std::random_device m_rd;
     std::mt19937 m_gen;
@@ -426,6 +432,172 @@ TEST_F(LargeTempTableBlockTest, sortTuplesStdSort) {
         summarize(blockOutput, totalSortDurationMicros);
     }
 }
+
+namespace {
+
+class LttSortRun {
+public:
+    LttSortRun(LargeTempTable* table)
+        : m_table(table)
+        , m_iterator(m_table->iteratorDeletingAsWeGo())
+        , m_curTuple(m_table->schema())
+    {
+        m_table->incrementRefcount();
+    }
+
+    ~LttSortRun() {
+        m_iterator = m_table->iteratorDeletingAsWeGo();
+        m_table->decrementRefcount();
+    }
+
+    void init() {
+        m_iterator = m_table->iteratorDeletingAsWeGo();
+        bool success = m_iterator.next(m_curTuple);
+        assert(success);
+    }
+
+    TableTuple& currentTuple() {
+        return m_curTuple;
+    }
+
+    const TableTuple& currentTuple() const {
+        return m_curTuple;
+    }
+
+    bool advance() {
+        return m_iterator.next(m_curTuple);
+    }
+
+private:
+    LargeTempTable* m_table;
+    TableIterator m_iterator;
+    TableTuple m_curTuple;
+};
+
+template<class TupleComparator>
+struct LttSortRunComparator {
+    LttSortRunComparator(const TupleComparator& tupleComparator)
+        : m_tupleComparator(tupleComparator)
+    {
+    }
+
+    bool operator()(const LttSortRun* run0, const LttSortRun* run1) {
+        const TableTuple& tuple0 = run0->currentTuple();
+        const TableTuple& tuple1 = run1->currentTuple();
+        return !m_tupleComparator(tuple0, tuple1);
+    }
+
+private:
+    const TupleComparator& m_tupleComparator;
+};
+
+}
+
+TEST_F(LargeTempTableBlockTest, mergeSortedBlocks) {
+    UniqueEngine engine = UniqueEngineBuilder()
+        .setTopend(std::unique_ptr<LargeTempTableTopend>(new LargeTempTableTopend()))
+        .build();
+    LargeTempTableBlockCache* lttBlockCache = ExecutorContext::getExecutorContext()->lttBlockCache();
+
+    TupleSchema *schema = getSchemaOfLength(VARCHAR_LENGTH, INLINE_PADDING);
+    std::vector<std::string> names;
+    names.push_back("strfld");
+    for (int i = 1; i < schema->columnCount(); ++i) {
+        names.push_back(boost::lexical_cast<std::string>(i));
+    }
+    auto ltt = makeUniqueTable(TableFactory::buildLargeTempTable("ltmp", schema, names));
+
+    StandAloneTupleStorage storage{schema};
+    TableTuple tupleToInsert = storage.tuple();
+    for (int i = 1; i < schema->columnCount(); ++i) {
+        tupleToInsert.setNValue(i, Tools::nvalueFromNative(int8_t(i)));
+    }
+
+    int numOriginalTuples = 0;
+
+    while (ltt->allocatedBlockCount() < 2) {
+        tupleToInsert.setNValue(0, Tools::nvalueFromNative(generateRandomString(VARCHAR_LENGTH)));
+        ltt->insertTuple(tupleToInsert);
+        ++numOriginalTuples;
+    }
+
+    int64_t tuplesPerBlock = ltt->activeTupleCount() - 1;
+    for (int64_t i = 1; i < tuplesPerBlock; ++i) {
+        tupleToInsert.setNValue(0, Tools::nvalueFromNative(generateRandomString(VARCHAR_LENGTH)));
+        ltt->insertTuple(tupleToInsert);
+        ++numOriginalTuples;
+    }
+
+    ASSERT_EQ(2, ltt->allocatedBlockCount());
+
+    int numInputBlocks = 11;
+    for (int64_t j = 2; j < numInputBlocks; ++j) {
+        for (int64_t i = 1; i < tuplesPerBlock; ++i) {
+            tupleToInsert.setNValue(0, Tools::nvalueFromNative(generateRandomString(VARCHAR_LENGTH)));
+            ltt->insertTuple(tupleToInsert);
+            ++numOriginalTuples;
+        }
+    }
+
+    ASSERT_EQ(numInputBlocks, ltt->allocatedBlockCount());
+
+    ltt->finishInserts();
+
+    // Input table complete
+    // Now sort it!!
+    // --------------------
+
+    typedef std::priority_queue<LttSortRun*, std::vector<LttSortRun*>, LttSortRunComparator<FirstFieldComparator>> SortRunPriorityQueue;
+    LttSortRunComparator<FirstFieldComparator> sortRunComparator{FirstFieldComparator{}};
+    SortRunPriorityQueue queue{sortRunComparator};
+
+    LTTBlockSorter<FirstFieldComparator> sorter{schema, FirstFieldComparator{}};
+    auto it = ltt->getBlockIds().begin();
+    while (it != ltt->getBlockIds().end()) {
+        int64_t blockId = *it;
+        it = ltt->disownBlock(it);
+        LargeTempTableBlock* block = lttBlockCache->fetchBlock(blockId);
+        sorter.sort(block->begin(), block->end());
+        block->unpin();
+        LargeTempTable* table = TableFactory::buildCopiedLargeTempTable("ltbl", ltt.get());
+        table->inheritBlock(blockId);
+        LttSortRun* sortRun = new LttSortRun(table);
+        sortRun->init();
+        queue.push(sortRun);
+    }
+
+    ASSERT_EQ(numInputBlocks, queue.size());
+
+    auto lttOutput = makeUniqueTable(TableFactory::buildCopiedLargeTempTable("ltmpOutput", ltt.get()));
+    while (queue.size() > 0) {
+        LttSortRun* run = queue.top();
+        queue.pop();
+        lttOutput->insertTuple(run->currentTuple());
+        if (run->advance()) {
+            queue.push(run);
+        }
+        else {
+            delete run;
+        }
+    }
+
+    lttOutput->finishInserts();
+
+    // Verify the result
+
+    ASSERT_EQ(numOriginalTuples, lttOutput->activeTupleCount());
+
+    FirstFieldComparator ffCompare;
+    TableIterator verifyIt = lttOutput->iterator();
+    TableTuple verifyTuple(lttOutput->schema());
+    TableTuple prevTuple(lttOutput->schema());
+    ASSERT_TRUE(verifyIt.next(prevTuple));
+    while (verifyIt.next(verifyTuple)) {
+        ASSERT_TRUE(ffCompare(prevTuple, verifyTuple));
+        prevTuple = verifyTuple;
+    }
+}
+
 
 int main(int argc, char* argv[]) {
     int opt;

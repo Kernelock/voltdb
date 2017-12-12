@@ -43,6 +43,12 @@ struct TableDeleter;
 template<class TableType>
 class UniqueTable {
 public:
+
+    UniqueTable()
+        : m_table()
+    {
+    }
+
     UniqueTable(TableType* tbl)
         : m_table(tbl)
     {
@@ -80,6 +86,7 @@ public:
 
     void reset(TableType* newTable = NULL) {
         m_table.reset(newTable);
+        m_table->incrementRefcount();
     }
 
 private:
