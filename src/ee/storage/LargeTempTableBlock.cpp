@@ -130,6 +130,11 @@ void LargeTempTableBlock::setData(char* origAddress,
     assert(m_storage.get() == NULL);
     storage.swap(m_storage);
 
+    // Update the insertion points to reflect the relocation
+    std::ptrdiff_t oldNewOffset = (m_storage.get() - origAddress);
+    m_tupleInsertionPoint += oldNewOffset;
+    m_nonInlinedInsertionPoint += oldNewOffset;
+
     relocateNonInlinedFields(origAddress);
 }
 
@@ -164,14 +169,23 @@ std::unique_ptr<char[]> LargeTempTableBlock::releaseData() {
 
 std::string LargeTempTableBlock::debug() const {
     std::ostringstream oss;
-    oss << "Block " << m_id << ", " << m_activeTupleCount << " tuples, ";
+    oss << "Block " << m_id << ", " << m_activeTupleCount << " tuples  ";
 
     if (! isResident()) {
-        oss << "not resident";
+        oss << "(not resident)";
     }
     else {
+        oss << "\n";
         TableTuple tuple{m_storage.get(), m_schema};
-        oss << "first tuple: " << tuple.debugSkipNonInlineData();
+        if (m_activeTupleCount >= 1) {
+            oss << "Block --> first tuple: " << tuple.debugSkipNonInlineData() << "\n";
+        }
+
+        if (m_activeTupleCount >= 2) {
+            char *lastTupleAddress = m_storage.get() + (tuple.tupleLength() * (m_activeTupleCount - 1));
+            tuple.move(lastTupleAddress);
+            oss << "Block --> last tuple: " << tuple.debugSkipNonInlineData() << "\n";
+        }
     }
 
     return oss.str();

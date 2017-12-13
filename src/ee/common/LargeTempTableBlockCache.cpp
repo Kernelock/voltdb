@@ -105,6 +105,20 @@ bool LargeTempTableBlockCache::blockIsPinned(int64_t blockId) const {
     return (*(mapIt->second))->isPinned();
 }
 
+void LargeTempTableBlockCache::invalidateStoredCopy(LargeTempTableBlock* block) {
+    if (! block->isStored()) {
+        return;
+    }
+
+    bool success = m_topend->releaseLargeTempTableBlock(block->id());
+    if (! success) {
+        throwSerializableEEException("Release of large temp table block failed");
+    }
+
+    block->unstore();
+}
+
+
 void LargeTempTableBlockCache::releaseBlock(int64_t blockId) {
     auto mapIt = m_idToBlockMap.find(blockId);
     if (mapIt == m_idToBlockMap.end()) {

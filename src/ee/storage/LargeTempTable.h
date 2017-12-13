@@ -143,6 +143,10 @@ public:
         return m_blockIds;
     }
 
+    const std::vector<int64_t>& getBlockIds() const {
+        return m_blockIds;
+    }
+
     std::vector<int64_t>::iterator disownBlock(std::vector<int64_t>::iterator pos) {
         LargeTempTableBlockCache* lttBlockCache = ExecutorContext::getExecutorContext()->lttBlockCache();
         m_tupleCount -= lttBlockCache->getBlockTupleCount(*pos);

@@ -447,14 +447,14 @@ public:
 
     ~LttSortRun() {
         if (m_table) {
-            m_iterator = m_table->iteratorDeletingAsWeGo();
+            m_iterator = m_table->iteratorDeletingAsWeGo(); // unpins block if scan in progress
             m_table->decrementRefcount();
         }
     }
 
     void init() {
         m_iterator = m_table->iteratorDeletingAsWeGo();
-        m_iterator.next(m_curTuple);
+        m_iterator.next(m_curTuple); // pins first block in LTT block cache
     }
 
     bool insertTuple(TableTuple& tuple) {
@@ -471,6 +471,16 @@ public:
 
     const TableTuple& currentTuple() const {
         return m_curTuple;
+    }
+
+    std::string debug() const {
+        std::ostringstream oss;
+        oss << "sort run with blocks: ";
+        BOOST_FOREACH(int64_t id, m_table->getBlockIds()) {
+            oss << id << " ";
+        }
+
+        return oss.str();
     }
 
     bool advance() {
@@ -516,6 +526,19 @@ private:
     const TupleComparator& m_tupleComparator;
 };
 
+template<class Compare>
+bool lessThanOrEqual(const Compare& lessThan, const TableTuple tuple0, const TableTuple tuple1) {
+    if (lessThan(tuple0, tuple1)) {
+        return true;
+    }
+
+    if (lessThan(tuple1, tuple0)) { // greater than
+        return false;
+    }
+
+    return true; // equal
+}
+
 bool verifySortedTable(LargeTempTable* table) {
     FirstFieldComparator ffCompare;
     TableIterator verifyIt = table->iterator();
@@ -529,7 +552,7 @@ bool verifySortedTable(LargeTempTable* table) {
 
     int tupleNum = 1;
     while (verifyIt.next(verifyTuple)) {
-        success = ffCompare(prevTuple, verifyTuple);
+        success = lessThanOrEqual(ffCompare, prevTuple, verifyTuple);
         if (!success) {
             std::cerr << "Failed to verify " << tupleNum << "th tuple:\n";
             std::cerr << "    prev tuple: " << prevTuple.debug() << "\n";
@@ -565,7 +588,10 @@ TEST_F(LargeTempTableBlockTest, mergeSortedBlocks) {
         tupleToInsert.setNValue(i, Tools::nvalueFromNative(int8_t(i)));
     }
 
-    std::cout << "\n\nLoading input table... ";
+    const int NUM_INPUT_BLOCKS = 529;
+
+    std::cout << "\n\nLoading input table with "
+              << NUM_INPUT_BLOCKS << " blocks";
     std::flush(std::cout);
     int numOriginalTuples = 0;
 
@@ -574,6 +600,8 @@ TEST_F(LargeTempTableBlockTest, mergeSortedBlocks) {
         ltt->insertTuple(tupleToInsert);
         ++numOriginalTuples;
     }
+    std::cout << ".";
+    std::cout.flush();
 
     int64_t tuplesPerBlock = ltt->activeTupleCount() - 1;
     for (int64_t i = 1; i < tuplesPerBlock; ++i) {
@@ -581,19 +609,23 @@ TEST_F(LargeTempTableBlockTest, mergeSortedBlocks) {
         ltt->insertTuple(tupleToInsert);
         ++numOriginalTuples;
     }
+    std::cout << ".";
+    std::cout.flush();
 
     ASSERT_EQ(2, ltt->allocatedBlockCount());
 
-    int numInputBlocks = 22;
-    for (int64_t j = 2; j < numInputBlocks; ++j) {
+    for (int64_t j = 2; j < NUM_INPUT_BLOCKS; ++j) {
         for (int64_t i = 1; i < tuplesPerBlock; ++i) {
             tupleToInsert.setNValue(0, Tools::nvalueFromNative(generateRandomString(VARCHAR_LENGTH)));
             ltt->insertTuple(tupleToInsert);
             ++numOriginalTuples;
         }
+
+        std::cout << ".";
+        std::cout.flush();
     }
 
-    ASSERT_EQ(numInputBlocks, ltt->allocatedBlockCount());
+    ASSERT_EQ(NUM_INPUT_BLOCKS, ltt->allocatedBlockCount());
 
     ltt->finishInserts();
 
@@ -605,7 +637,7 @@ TEST_F(LargeTempTableBlockTest, mergeSortedBlocks) {
     // Now sort it!!
     // --------------------
 
-    std::cout << "Sorting initial set of " << numInputBlocks << " LTT blocks ("
+    std::cout << "\n\nSorting initial set of " << NUM_INPUT_BLOCKS << " LTT blocks ("
               << tuplesPerBlock << " tuples per block)";
     std::flush(std::cout);
 
@@ -618,6 +650,7 @@ TEST_F(LargeTempTableBlockTest, mergeSortedBlocks) {
         it = ltt->disownBlock(it);
         LargeTempTableBlock* block = lttBlockCache->fetchBlock(blockId);
         sorter.sort(block->begin(), block->end());
+        lttBlockCache->invalidateStoredCopy(block);
         block->unpin();
         LargeTempTable* table = TableFactory::buildCopiedLargeTempTable("ltbl", ltt.get());
         table->inheritBlock(blockId);
@@ -625,20 +658,24 @@ TEST_F(LargeTempTableBlockTest, mergeSortedBlocks) {
         LttSortRunPtr sortRun{new LttSortRun(table)};
         sortRunQueue.push(sortRun);
         std::cout << ".";
-        std::flush(std::cout);
+        std::cout.flush();
     }
 
     std::cout << " Done." << std::endl;
 
-    ASSERT_EQ(numInputBlocks, sortRunQueue.size());
+    ASSERT_EQ(NUM_INPUT_BLOCKS, sortRunQueue.size());
+
+    // Now merge single-block runs into longer runs, until there is just one left
 
     const int MERGE_FACTOR = 11;
     while (sortRunQueue.size() != 1) {
-        typedef std::priority_queue<LttSortRunPtr, std::vector<LttSortRunPtr>, LttSortRunComparator<FirstFieldComparator>> SortRunPriorityQueue;
-        LttSortRunComparator<FirstFieldComparator> sortRunComparator{FirstFieldComparator{}};
-        SortRunPriorityQueue mergeHeap{sortRunComparator};
+        typedef LttSortRunComparator<FirstFieldComparator> SRComparator;
+        typedef std::priority_queue<LttSortRunPtr, std::vector<LttSortRunPtr>, SRComparator> SortRunPriorityQueue;
+        SortRunPriorityQueue mergeHeap{SRComparator{FirstFieldComparator{}}};
 
-        std::cout << "Beginning merge pass ";
+        //std::cout << "\n\nBefore merge, state of block cache: " << lttBlockCache->debug() << std::endl;
+
+        std::cout << "\nBeginning merge\n";
         std::flush(std::cout);
 
         for (int i = 0; i < MERGE_FACTOR; ++i) {
@@ -647,14 +684,14 @@ TEST_F(LargeTempTableBlockTest, mergeSortedBlocks) {
             }
 
             LttSortRunPtr run = sortRunQueue.front();
+            std::cout << "    " << run->debug() << "\n";
             sortRunQueue.pop();
             run->init();
             mergeHeap.push(run);
-            std::cout << "\n\nTop of heap: " << mergeHeap.top()->currentTuple().debug() << std::endl;
+            //std::cout << "\n\nInitial pushes, top of heap: " << mergeHeap.top()->currentTuple().debug() << std::endl;
         }
 
-        std::cout << "of " << mergeHeap.size() << " runs... ";
-        std::flush(std::cout);
+        std::cout.flush();
 
         LttSortRunPtr outputSortRun(new LttSortRun(TableFactory::buildCopiedLargeTempTable("ltbl", ltt.get())));
         while (mergeHeap.size() > 0) {
@@ -663,22 +700,18 @@ TEST_F(LargeTempTableBlockTest, mergeSortedBlocks) {
 
             outputSortRun->insertTuple(run->currentTuple());
             if (run->advance()) {
-                mergeHeap.push(std::move(run));
+                mergeHeap.push(run);
             }
         }
 
         outputSortRun->finishInserts();
-
-        std::cout << "verifying... ";
-        std::flush(std::cout);
-
-        ASSERT_TRUE(verifySortedTable(outputSortRun->peekTable()));
-
         sortRunQueue.push(outputSortRun);
         std::cout << "Done." << std::endl;
     }
 
-    std::cout << "Verifying result... ";
+    //std::cout << "\n\nAll merges complete, state of block cache: " << lttBlockCache->debug() << std::endl;
+
+    std::cout << "\n\nVerifying result... ";
 
     // Verify the result
     auto lttOutput = makeUniqueTable(sortRunQueue.front()->releaseTable());
@@ -687,6 +720,8 @@ TEST_F(LargeTempTableBlockTest, mergeSortedBlocks) {
     ASSERT_EQ(numOriginalTuples, lttOutput->activeTupleCount());
 
     ASSERT_TRUE(verifySortedTable(lttOutput.get()));
+
+    ASSERT_EQ(numOriginalTuples, lttOutput->activeTupleCount());
     std::cout << "Done." << std::endl;
 }
 

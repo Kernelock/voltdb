@@ -96,6 +96,7 @@ public:
 
     bool storeLargeTempTableBlock(voltdb::LargeTempTableBlock* block) {
         assert (m_map.count(block->id()) == 0);
+        //std::cout << "--> Topend storing block " << block->id() << std::endl;
 
         std::unique_ptr<char[]> storage = block->releaseData();
         Block *newBlock = new Block{storage.get(), block->activeTupleCount(), block->schema()};
@@ -106,6 +107,7 @@ public:
 
     bool loadLargeTempTableBlock(voltdb::LargeTempTableBlock* block) {
         auto it = m_map.find(block->id());
+        //std::cout << "--> Topend loading block " << block->id() << std::endl;
         assert (it != m_map.end());
         Block *storedBlock = it->second;
 
@@ -118,6 +120,7 @@ public:
     }
 
     bool releaseLargeTempTableBlock(int64_t blockId) {
+        //std::cout << "--> Topend releasing block " << blockId << std::endl;
         auto it = m_map.find(blockId);
         if (it == m_map.end()) {
             assert(false);

@@ -76,6 +76,14 @@ class LargeTempTableBlockCache {
         necessary.  */
     LargeTempTableBlock* fetchBlock(int64_t blockId);
 
+    /** The large temp table for this block is being destroyed, so
+        release all resources associated with this block. */
+    void releaseBlock(int64_t blockId);
+
+    /** The block may have changed in-place (e.g., if we sorted it),
+        so remove the copy on disk. */
+    void invalidateStoredCopy(LargeTempTableBlock* block);
+
     /** Get the tuple count for the given block.  Does
         not fetch or pin the block. */
     int64_t getBlockTupleCount(int64_t blockId) {
@@ -83,10 +91,6 @@ class LargeTempTableBlockCache {
         assert(it != m_idToBlockMap.end());
         return it->second->get()->activeTupleCount();
     }
-
-    /** The large temp table for this block is being destroyed, so
-        release all resources associated with this block. */
-    void releaseBlock(int64_t blockId);
 
     /** The number of pinned (blocks currently being inserted into or
         scanned) entries in the cache */

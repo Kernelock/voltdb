@@ -163,6 +163,10 @@ public:
         return m_isStored;
     }
 
+    void unstore() {
+        m_isStored = false;
+    }
+
     /** Return the number of tuples in this block */
     int64_t activeTupleCount() const {
         return m_activeTupleCount;
