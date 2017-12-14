@@ -156,9 +156,12 @@ class LargeTempTableBlockCache {
         return (it->second)->get();
     }
 
+    /** Produce a string describing the number of cache hits and misses. */
+    std::string statsForDebug() const;
+
  private:
 
-    // This at some point may need to be unique across the entire process
+    // This at some point may need to be unique across the entire cluster
     int64_t getNextId() {
         int64_t nextId = m_nextId;
         ++m_nextId;
@@ -175,14 +178,18 @@ class LargeTempTableBlockCache {
 
     typedef std::list<std::unique_ptr<LargeTempTableBlock>> BlockList;
 
-    // The front of the block list are the most recently used blocks.
-    // The tail will be the least recently used blocks.
-    // The tail of the list should have no pinned blocks.
+    // The block list is ordered by the time to the next reference to the block:
+    //   Blocks in the front are expected to be referenced in the immediate future
+    //   Blocks at the end are expected to be referenced in the distant future
     BlockList m_blockList;
     std::map<int64_t, BlockList::iterator> m_idToBlockMap;
 
     int64_t m_nextId;
     int64_t m_totalAllocatedBytes;
+
+    /** stats: */
+    int64_t m_numCacheMisses; // calls to "fetch" that required a store/load
+    int64_t m_numCacheHits; // calls to "fetch" blocks already resident
 };
 
 }

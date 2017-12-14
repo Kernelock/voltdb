@@ -33,6 +33,8 @@ LargeTempTableBlockCache::LargeTempTableBlockCache(Topend *topend, int64_t maxCa
     , m_idToBlockMap()
     , m_nextId(0)
     , m_totalAllocatedBytes(0)
+    , m_numCacheMisses(0)
+    , m_numCacheHits(0)
 {
 }
 
@@ -45,14 +47,15 @@ LargeTempTableBlock* LargeTempTableBlockCache::getEmptyBlock(TupleSchema* schema
 
     int64_t id = getNextId();
 
-    m_blockList.emplace_front(new LargeTempTableBlock(id, schema));
-    auto it = m_blockList.begin();
+    m_blockList.emplace_back(new LargeTempTableBlock(id, schema));
+    auto it = m_blockList.end();
+    --it;
     m_idToBlockMap[id] = it;
     (*it)->pin();
 
     m_totalAllocatedBytes += LargeTempTableBlock::BLOCK_SIZE_IN_BYTES;
 
-    return m_blockList.front().get();
+    return it->get();
 }
 
 LargeTempTableBlock* LargeTempTableBlockCache::fetchBlock(int64_t blockId) {
@@ -64,6 +67,7 @@ LargeTempTableBlock* LargeTempTableBlockCache::fetchBlock(int64_t blockId) {
     auto listIt = mapIt->second;
     assert ((*listIt)->id() == blockId);
     if (! (*listIt)->isResident()) {
+        ++m_numCacheMisses;
         ensureSpaceForNewBlock();
 
         bool rc = m_topend->loadLargeTempTableBlock(listIt->get());
@@ -71,18 +75,23 @@ LargeTempTableBlock* LargeTempTableBlockCache::fetchBlock(int64_t blockId) {
         assert (! (*listIt)->isPinned());
         m_totalAllocatedBytes += LargeTempTableBlock::BLOCK_SIZE_IN_BYTES;
     }
+    else {
+        ++m_numCacheHits;
+    }
 
     (*listIt)->pin();
 
-    // Also need to move it to the front of the queue.
+    // Also need to move it to the back of the queue.
     std::unique_ptr<LargeTempTableBlock> blockPtr;
     blockPtr.swap(*listIt);
 
     m_blockList.erase(listIt);
-    m_blockList.emplace_front(std::move(blockPtr));
-    m_idToBlockMap[blockId] = m_blockList.begin();
+    m_blockList.emplace_back(std::move(blockPtr));
+    auto it = m_blockList.end();
+    --it;
+    m_idToBlockMap[blockId] = it;
 
-    LargeTempTableBlock* block = m_blockList.begin()->get();
+    LargeTempTableBlock* block = it->get();
     assert (block->id() == blockId);
     return block;
 }
@@ -237,6 +246,14 @@ std::string LargeTempTableBlockCache::debug() const {
 
     oss << "Total bytes used: " << allocatedMemory() << "\n";
 
+    return oss.str();
+}
+
+std::string LargeTempTableBlockCache::statsForDebug() const {
+    std::ostringstream oss;
+    oss << "LargeTempTableBlockCache stats:\n"
+        << "    Number of cache hits:    " << m_numCacheHits << "\n"
+        << "    Number of cache misses:  " << m_numCacheMisses << "\n";
     return oss.str();
 }
 
