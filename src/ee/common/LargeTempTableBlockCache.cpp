@@ -42,7 +42,7 @@ LargeTempTableBlockCache::~LargeTempTableBlockCache() {
     assert (m_blockList.size() == 0);
 }
 
-LargeTempTableBlock* LargeTempTableBlockCache::getEmptyBlock(TupleSchema* schema) {
+LargeTempTableBlock* LargeTempTableBlockCache::getEmptyBlock(const TupleSchema* schema) {
     ensureSpaceForNewBlock();
 
     int64_t id = getNextId();

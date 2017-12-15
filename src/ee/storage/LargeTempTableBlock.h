@@ -72,7 +72,7 @@ public:
     static const size_t BLOCK_SIZE_IN_BYTES = 8 * 1024 * 1024; // 8 MB
 
     /** constructor for a new block. */
-    LargeTempTableBlock(int64_t id, TupleSchema* schema);
+    LargeTempTableBlock(int64_t id, const TupleSchema* schema);
 
     /** Return the unique ID for this block */
     int64_t id() const {
@@ -177,9 +177,21 @@ public:
         return m_schema;
     }
 
-    /** Return the schema of the tuples in this block (non-const version) */
-    TupleSchema* schema() {
-        return m_schema;
+    /* /\** Return the schema of the tuples in this block (non-const version) *\/ */
+    /* TupleSchema* schema() { */
+    /*     return m_schema; */
+    /* } */
+
+    /** Swap the contents of the two blocks.  It's up to the caller to
+        invalidate any copies of this block in disk. */
+    void swap(LargeTempTableBlock* otherBlock) {
+        assert(m_schema->isCompatibleForMemcpy(otherBlock->m_schema));
+        // id should stay the same
+        // m_schema is the same
+        m_storage.swap(otherBlock->m_storage);
+        std::swap(m_tupleInsertionPoint, otherBlock->m_tupleInsertionPoint);
+        std::swap(m_nonInlinedInsertionPoint, otherBlock->m_nonInlinedInsertionPoint);
+        std::swap(m_activeTupleCount, otherBlock->m_activeTupleCount);
     }
 
     /** Clear all the data out of this block. */
@@ -232,7 +244,7 @@ public:
     int64_t m_id;
 
     /** the schema for the data (owned by the table) */
-    TupleSchema * m_schema;
+    const TupleSchema * m_schema;
 
     /** Pointer to block storage */
     std::unique_ptr<char[]> m_storage;

@@ -15,6 +15,9 @@
  * along with VoltDB.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <chrono>
+#include <random>
+
 #include "common/LargeTempTableBlockCache.h"
 #include "storage/LargeTempTable.h"
 #include "storage/LargeTempTableBlock.h"
@@ -182,15 +185,61 @@ public:
     typedef LargeTempTableBlock::iterator iterator;
     typedef iterator::difference_type difference_type;
 
-    BlockSorter(const TupleSchema* schema, const AbstractExecutor::TupleComparer& compare)
-        : m_schema(schema)
+    BlockSorter(LargeTempTableBlockCache* lttBlockCache,
+                const TupleSchema* schema,
+                const AbstractExecutor::TupleComparer& compare)
+        : m_lttBlockCache(lttBlockCache)
+        , m_schema(schema)
         , m_tempStorage(schema)
         , m_tempTuple(m_tempStorage.tuple())
         , m_compare(compare)
+        , m_rng(std::chrono::system_clock::now().time_since_epoch().count())
     {
     }
 
-    void sort(LargeTempTableBlock::iterator beginIt,
+    void sort(LargeTempTableBlock* block) {
+        // if there are non-inlined columns, then an in-place
+        // sort is usually faster, because we don't have to
+        // move any non-inlined values.
+        if (m_schema->getUninlinedObjectColumnCount() > 0) {
+            // Do an in-place quicksort
+            quicksort(block->begin(), block->end());
+        }
+        else {
+            // There's no non-inlined data in this block, so
+            // do a faster out-of-place sort.
+            std::vector<TableTuple> ttVector;
+            BOOST_FOREACH (auto& tuple, *block) {
+                ttVector.push_back(tuple.toTableTuple(m_schema));
+            }
+
+            // Sort the vector of TableTuples.
+            std::sort(ttVector.begin(), ttVector.end(), m_compare);
+
+            LargeTempTableBlock *outputBlock = m_lttBlockCache->getEmptyBlock(m_schema);
+
+            // Copy all the non-inlined data at once
+            outputBlock->copyNonInlinedData(*block);
+
+            // Copy each tuple in the input block to the output block
+            BOOST_FOREACH (TableTuple& tuple, ttVector) {
+                bool success = outputBlock->insertTupleRelocateNonInlinedFields(tuple, block->address());
+                if (! success) {
+                    throwSerializableEEException("Failed to insert into LTT block during out-of-place sort");
+                }
+            }
+
+            // Swap the blocks so that the caller sees the input block as sorted.
+            block->swap(outputBlock);
+
+            outputBlock->unpin();
+            m_lttBlockCache->releaseBlock(outputBlock->id());
+        }
+    }
+
+private:
+
+    void quicksort(LargeTempTableBlock::iterator beginIt,
               LargeTempTableBlock::iterator endIt) {
         while (true) {
             difference_type numElems = endIt - beginIt;
@@ -201,13 +250,15 @@ public:
             case 2: insertionSort<2>(beginIt); return;
             case 3: insertionSort<3>(beginIt); return;
             case 4: insertionSort<4>(beginIt); return;
-            // case 5: insertionSort<5>(beginIt); return;
-            // case 6: insertionSort<6>(beginIt); return;
             default:
                 break;
             }
 
-            iterator pivot = endIt - 1;
+            // choose a pivot randomly to avoid worst-case behavior
+            iterator pivot = beginIt + m_rng() % numElems;
+            swap(*pivot, endIt[-1]);
+            pivot = endIt - 1;
+
             difference_type i = -1; // index of last less-than-pivot element
             for (difference_type j = 0; j < numElems - 1; ++j) {
                 iterator it = beginIt + j;
@@ -228,18 +279,18 @@ public:
             // Make recursive call for smaller partition,
             // and use tail recursion elimination for larger one.
             if (pivot - beginIt > endIt - (pivot + 1))  {
-                sort(pivot + 1, endIt);
+                quicksort(pivot + 1, endIt);
                 endIt = pivot;
             }
             else {
-                sort(beginIt, pivot);
+                quicksort(beginIt, pivot);
                 beginIt = pivot + 1;
             }
         }
     }
 
-private:
-
+    // A simple insertion sort, which is efficient if N is small.
+    // N is a compile time parameter here to encourage loop unrolling.
     template<int N>
     void insertionSort(LargeTempTableBlock::iterator beginIt) {
         assert (N > 1);
@@ -266,10 +317,12 @@ private:
         }
     }
 
+    LargeTempTableBlockCache* m_lttBlockCache;
     const TupleSchema* m_schema;
     StandAloneTupleStorage m_tempStorage;
     TableTuple m_tempTuple;
     const AbstractExecutor::TupleComparer& m_compare;
+    std::ranlux48_base m_rng;
 };
 
 
@@ -325,18 +378,8 @@ public:
         return m_iterator.next(m_curTuple);
     }
 
-    LargeTempTable* releaseTable() {
-        LargeTempTable* tbl = m_table;
-        m_table = NULL;
-        return tbl;
-    }
-
     LargeTempTable* peekTable() {
         return m_table;
-    }
-
-    int64_t tupleCount() const {
-        return m_table->activeTupleCount();
     }
 
 private:
@@ -353,7 +396,6 @@ struct SortRunComparer {
     {
     }
 
-    // Should implement greater-than
     bool operator()(const SortRunPtr& run0, const SortRunPtr& run1) {
         const TableTuple& tuple0 = run0->currentTuple();
         const TableTuple& tuple1 = run1->currentTuple();
@@ -370,17 +412,22 @@ private:
 }
 
 void LargeTempTable::sort(const AbstractExecutor::TupleComparer& comparer, int limit, int offset) {
+
+    if (limit != -1 || offset != 0) {
+        throwSerializableEEException("Limit and offset not yet supported on large temp tables");
+    }
+
     LargeTempTableBlockCache* lttBlockCache = ExecutorContext::getExecutorContext()->lttBlockCache();
 
     // Sort each block and create a bunch of 1-block sort runs to be merged below
     std::queue<SortRunPtr> sortRunQueue;
-    BlockSorter sorter{m_schema, comparer};
+    BlockSorter sorter{lttBlockCache, m_schema, comparer};
     auto it = getBlockIds().begin();
     while (it != getBlockIds().end()) {
         int64_t blockId = *it;
         it = disownBlock(it);
         LargeTempTableBlock* block = lttBlockCache->fetchBlock(blockId);
-        sorter.sort(block->begin(), block->end());
+        sorter.sort(block);
         lttBlockCache->invalidateStoredCopy(block);
         block->unpin();
         LargeTempTable* table = TableFactory::buildCopiedLargeTempTable("largesort", this);
@@ -391,9 +438,8 @@ void LargeTempTable::sort(const AbstractExecutor::TupleComparer& comparer, int l
 
     const int MERGE_FACTOR = 11;
     while (sortRunQueue.size() != 1) {
-        typedef SortRunComparer SRComparer;
-        typedef std::priority_queue<SortRunPtr, std::vector<SortRunPtr>, SRComparer> SortRunPriorityQueue;
-        SortRunPriorityQueue mergeHeap{SRComparer{comparer}};
+        typedef std::priority_queue<SortRunPtr, std::vector<SortRunPtr>, SortRunComparer> SortRunPriorityQueue;
+        SortRunPriorityQueue mergeHeap{SortRunComparer{comparer}};
 
         for (int i = 0; i < MERGE_FACTOR; ++i) {
             if (sortRunQueue.empty()) {

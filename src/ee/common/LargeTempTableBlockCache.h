@@ -63,7 +63,7 @@ class LargeTempTableBlockCache {
     ~LargeTempTableBlockCache();
 
     /** Get a new empty large temp table block. */
-    LargeTempTableBlock* getEmptyBlock(TupleSchema* schema);
+    LargeTempTableBlock* getEmptyBlock(const TupleSchema* schema);
 
     /** "Unpin" the specified block, i.e., mark it as a candidate to
         store to disk when the cache becomes full. */

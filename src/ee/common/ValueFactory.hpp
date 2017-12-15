@@ -258,6 +258,8 @@ public:
         }
         throwDynamicSQLException("Default value parsing error.");
     }
+
+    static NValue getRandomValue(ValueType type, uint32_t maxLength, Pool* pool = NULL);
 };
 }
 #endif /* VALUEFACTORY_HPP_ */
