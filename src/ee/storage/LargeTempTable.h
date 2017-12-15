@@ -19,6 +19,7 @@
 #define VOLTDB_LARGETEMPTABLE_H
 
 #include "common/LargeTempTableBlockCache.h"
+#include "executors/abstractexecutor.h"
 #include "storage/AbstractTempTable.hpp"
 #include "storage/tableiterator.h"
 
@@ -85,6 +86,8 @@ public:
         complete. */
     virtual void finishInserts();
 
+    void sort(const AbstractExecutor::TupleComparer& comparer, int limit, int offset);
+
     /** Releases the specified block.  Called by delete-as-you-go
         iterators.  Returns an iterator pointing to the next block
         id. */
@@ -130,14 +133,7 @@ public:
     /**
      * Swap the contents of this table with another.
      */
-    virtual void swapContents(AbstractTempTable* otherTable) {
-        // There is no reason that this can't be supported.  TODO: add
-        // support for this operation and related unit tests.  Things
-        // to think about: enforce restriction on pinned blocks, or
-        // whether or not table can be swapped if inserts are still
-        // ongoing?
-        throwSerializableEEException("swapContents not supported on large temp tables");
-    }
+    virtual void swapContents(AbstractTempTable* otherTable);
 
     std::vector<int64_t>& getBlockIds() {
         return m_blockIds;

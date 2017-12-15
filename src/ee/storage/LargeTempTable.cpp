@@ -18,6 +18,7 @@
 #include "common/LargeTempTableBlockCache.h"
 #include "storage/LargeTempTable.h"
 #include "storage/LargeTempTableBlock.h"
+#include "storage/tablefactory.h"
 
 namespace voltdb {
 
@@ -125,6 +126,17 @@ std::vector<int64_t>::iterator LargeTempTable::releaseBlock(std::vector<int64_t>
     return m_blockIds.erase(it);
 }
 
+void LargeTempTable::swapContents(AbstractTempTable* otherTable) {
+    assert (dynamic_cast<LargeTempTable*>(otherTable));
+    LargeTempTable* otherLargeTable = static_cast<LargeTempTable*>(otherTable);
+
+    m_blockIds.swap(otherLargeTable->m_blockIds);
+    std::swap(m_tupleCount, otherLargeTable->m_tupleCount);
+    if (m_blockForWriting || otherLargeTable->m_blockForWriting) {
+        throwSerializableEEException("Please only swap large temp tables after finishInserts has been called");
+    }
+}
+
 LargeTempTable::~LargeTempTable() {
     deleteAllTempTuples();
 }
@@ -159,5 +171,258 @@ std::string LargeTempTable::debug(const std::string& spacer) const {
 
     return oss.str();
 }
+
+
+// Sorting-related classes and methods below
+
+namespace {
+
+class BlockSorter {
+public:
+    typedef LargeTempTableBlock::iterator iterator;
+    typedef iterator::difference_type difference_type;
+
+    BlockSorter(const TupleSchema* schema, const AbstractExecutor::TupleComparer& compare)
+        : m_schema(schema)
+        , m_tempStorage(schema)
+        , m_tempTuple(m_tempStorage.tuple())
+        , m_compare(compare)
+    {
+    }
+
+    void sort(LargeTempTableBlock::iterator beginIt,
+              LargeTempTableBlock::iterator endIt) {
+        while (true) {
+            difference_type numElems = endIt - beginIt;
+            switch (numElems) {
+            case 0:
+            case 1:
+                return;
+            case 2: insertionSort<2>(beginIt); return;
+            case 3: insertionSort<3>(beginIt); return;
+            case 4: insertionSort<4>(beginIt); return;
+            // case 5: insertionSort<5>(beginIt); return;
+            // case 6: insertionSort<6>(beginIt); return;
+            default:
+                break;
+            }
+
+            iterator pivot = endIt - 1;
+            difference_type i = -1; // index of last less-than-pivot element
+            for (difference_type j = 0; j < numElems - 1; ++j) {
+                iterator it = beginIt + j;
+                if (m_compare(it->toTableTuple(m_schema), pivot->toTableTuple(m_schema))) {
+                    ++i;
+                    swap(*it, beginIt[i]);
+                }
+            }
+
+            // move the pivot to the correct place
+            ++i; // index of first greater-than-or-equal-to-pivot element
+            if (m_compare(pivot->toTableTuple(m_schema), beginIt[i].toTableTuple(m_schema))) {
+                swap(*pivot, beginIt[i]);
+            }
+
+            pivot = beginIt + i; // pivot is now in correct ordinal position
+
+            // Make recursive call for smaller partition,
+            // and use tail recursion elimination for larger one.
+            if (pivot - beginIt > endIt - (pivot + 1))  {
+                sort(pivot + 1, endIt);
+                endIt = pivot;
+            }
+            else {
+                sort(beginIt, pivot);
+                beginIt = pivot + 1;
+            }
+        }
+    }
+
+private:
+
+    template<int N>
+    void insertionSort(LargeTempTableBlock::iterator beginIt) {
+        assert (N > 1);
+
+        for (difference_type i = 0; i < N; ++i) {
+            int j = i;
+            while (j > 0 && m_compare(beginIt[j].toTableTuple(m_schema), beginIt[j - 1].toTableTuple(m_schema))) {
+                swap(beginIt[j - 1], beginIt[j]);
+                --j;
+            }
+        }
+    }
+
+    void swap(LargeTempTableBlock::Tuple& t0,
+              LargeTempTableBlock::Tuple& t1) {
+        if (&t0 != &t1) {
+            int tupleLength = m_tempTuple.tupleLength();
+            char* tempBuffer = m_tempTuple.address();
+            char* buf0 = reinterpret_cast<char*>(&t0);
+            char* buf1 = reinterpret_cast<char*>(&t1);
+            ::memcpy(tempBuffer, buf0, tupleLength);
+            ::memcpy(buf0, buf1, tupleLength);
+            ::memcpy(buf1, tempBuffer, tupleLength);
+        }
+    }
+
+    const TupleSchema* m_schema;
+    StandAloneTupleStorage m_tempStorage;
+    TableTuple m_tempTuple;
+    const AbstractExecutor::TupleComparer& m_compare;
+};
+
+
+class SortRun {
+public:
+    SortRun(LargeTempTable* table)
+        : m_table(table)
+        , m_iterator(m_table->iteratorDeletingAsWeGo())
+        , m_curTuple(m_table->schema())
+    {
+        m_table->incrementRefcount();
+    }
+
+    ~SortRun() {
+        if (m_table) {
+            m_iterator = m_table->iteratorDeletingAsWeGo(); // unpins block if scan in progress
+            m_table->decrementRefcount();
+        }
+    }
+
+    void init() {
+        m_iterator = m_table->iteratorDeletingAsWeGo();
+        m_iterator.next(m_curTuple); // pins first block in LTT block cache
+    }
+
+    bool insertTuple(TableTuple& tuple) {
+        return m_table->insertTuple(tuple);
+    }
+
+    void finishInserts() {
+        m_table->finishInserts();
+    }
+
+    TableTuple& currentTuple() {
+        return m_curTuple;
+    }
+
+    const TableTuple& currentTuple() const {
+        return m_curTuple;
+    }
+
+    std::string debug() const {
+        std::ostringstream oss;
+        oss << "sort run with blocks: ";
+        BOOST_FOREACH(int64_t id, m_table->getBlockIds()) {
+            oss << id << " ";
+        }
+
+        return oss.str();
+    }
+
+    bool advance() {
+        return m_iterator.next(m_curTuple);
+    }
+
+    LargeTempTable* releaseTable() {
+        LargeTempTable* tbl = m_table;
+        m_table = NULL;
+        return tbl;
+    }
+
+    LargeTempTable* peekTable() {
+        return m_table;
+    }
+
+    int64_t tupleCount() const {
+        return m_table->activeTupleCount();
+    }
+
+private:
+    LargeTempTable* m_table;
+    TableIterator m_iterator;
+    TableTuple m_curTuple;
+};
+
+typedef std::shared_ptr<SortRun> SortRunPtr;
+
+struct SortRunComparer {
+    SortRunComparer(const AbstractExecutor::TupleComparer& tupleComparer)
+        : m_tupleComparer(tupleComparer)
+    {
+    }
+
+    // Should implement greater-than
+    bool operator()(const SortRunPtr& run0, const SortRunPtr& run1) {
+        const TableTuple& tuple0 = run0->currentTuple();
+        const TableTuple& tuple1 = run1->currentTuple();
+
+        // transpose arguments to get greater-than instead of
+        // less-than.
+        return m_tupleComparer(tuple1, tuple0);
+    }
+
+private:
+    const AbstractExecutor::TupleComparer& m_tupleComparer;
+};
+
+}
+
+void LargeTempTable::sort(const AbstractExecutor::TupleComparer& comparer, int limit, int offset) {
+    LargeTempTableBlockCache* lttBlockCache = ExecutorContext::getExecutorContext()->lttBlockCache();
+
+    // Sort each block and create a bunch of 1-block sort runs to be merged below
+    std::queue<SortRunPtr> sortRunQueue;
+    BlockSorter sorter{m_schema, comparer};
+    auto it = getBlockIds().begin();
+    while (it != getBlockIds().end()) {
+        int64_t blockId = *it;
+        it = disownBlock(it);
+        LargeTempTableBlock* block = lttBlockCache->fetchBlock(blockId);
+        sorter.sort(block->begin(), block->end());
+        lttBlockCache->invalidateStoredCopy(block);
+        block->unpin();
+        LargeTempTable* table = TableFactory::buildCopiedLargeTempTable("largesort", this);
+        table->inheritBlock(blockId);
+        SortRunPtr sortRun{new SortRun(table)};
+        sortRunQueue.push(sortRun);
+    }
+
+    const int MERGE_FACTOR = 11;
+    while (sortRunQueue.size() != 1) {
+        typedef SortRunComparer SRComparer;
+        typedef std::priority_queue<SortRunPtr, std::vector<SortRunPtr>, SRComparer> SortRunPriorityQueue;
+        SortRunPriorityQueue mergeHeap{SRComparer{comparer}};
+
+        for (int i = 0; i < MERGE_FACTOR; ++i) {
+            if (sortRunQueue.empty()) {
+                break;
+            }
+
+            SortRunPtr run = sortRunQueue.front();
+            sortRunQueue.pop();
+            run->init();
+            mergeHeap.push(run);
+        }
+
+        SortRunPtr outputSortRun(new SortRun(TableFactory::buildCopiedLargeTempTable("largesort", this)));
+        while (mergeHeap.size() > 0) {
+            SortRunPtr run = mergeHeap.top();
+            mergeHeap.pop();
+
+            outputSortRun->insertTuple(run->currentTuple());
+            if (run->advance()) {
+                mergeHeap.push(run);
+            }
+        }
+
+        outputSortRun->finishInserts();
+        sortRunQueue.push(outputSortRun);
+    }
+
+    swapContents(sortRunQueue.front()->peekTable());
+}
+
 
 } // namespace voltdb

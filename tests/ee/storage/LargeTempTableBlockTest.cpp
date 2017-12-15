@@ -35,6 +35,8 @@
 #include "common/TupleSchema.h"
 #include "common/TupleSchemaBuilder.h"
 
+#include "expressions/tuplevalueexpression.h"
+
 #include "storage/LargeTempTableBlock.h"
 #include "storage/LargeTempTable.h"
 #include "storage/tablefactory.h"
@@ -444,101 +446,6 @@ TEST_F(LargeTempTableBlockTest, sortTuplesStdSort) {
 
 namespace {
 
-class LttSortRun {
-public:
-    LttSortRun(LargeTempTable* table)
-        : m_table(table)
-        , m_iterator(m_table->iteratorDeletingAsWeGo())
-        , m_curTuple(m_table->schema())
-    {
-        m_table->incrementRefcount();
-    }
-
-    ~LttSortRun() {
-        if (m_table) {
-            m_iterator = m_table->iteratorDeletingAsWeGo(); // unpins block if scan in progress
-            m_table->decrementRefcount();
-        }
-    }
-
-    void init() {
-        m_iterator = m_table->iteratorDeletingAsWeGo();
-        m_iterator.next(m_curTuple); // pins first block in LTT block cache
-    }
-
-    bool insertTuple(TableTuple& tuple) {
-        return m_table->insertTuple(tuple);
-    }
-
-    void finishInserts() {
-        m_table->finishInserts();
-    }
-
-    TableTuple& currentTuple() {
-        return m_curTuple;
-    }
-
-    const TableTuple& currentTuple() const {
-        return m_curTuple;
-    }
-
-    std::string debug() const {
-        std::ostringstream oss;
-        oss << "sort run with blocks: ";
-        BOOST_FOREACH(int64_t id, m_table->getBlockIds()) {
-            oss << id << " ";
-        }
-
-        return oss.str();
-    }
-
-    bool advance() {
-        return m_iterator.next(m_curTuple);
-    }
-
-    LargeTempTable* releaseTable() {
-        LargeTempTable* tbl = m_table;
-        m_table = NULL;
-        return tbl;
-    }
-
-    LargeTempTable* peekTable() {
-        return m_table;
-    }
-
-    int64_t tupleCount() const {
-        return m_table->activeTupleCount();
-    }
-
-private:
-    LargeTempTable* m_table;
-    TableIterator m_iterator;
-    TableTuple m_curTuple;
-};
-
-typedef std::shared_ptr<LttSortRun> LttSortRunPtr;
-
-template<class TupleComparator>
-struct LttSortRunComparator {
-    LttSortRunComparator(const TupleComparator& tupleComparator)
-        : m_tupleComparator(tupleComparator)
-    {
-    }
-
-    // Should implement greater-than
-    bool operator()(const LttSortRunPtr& run0, const LttSortRunPtr& run1) {
-        const TableTuple& tuple0 = run0->currentTuple();
-        const TableTuple& tuple1 = run1->currentTuple();
-
-        // transpose arguments to get greater-than instead of
-        // less-than.
-        return m_tupleComparator(tuple1, tuple0);
-    }
-
-private:
-    const TupleComparator& m_tupleComparator;
-};
-
 template<class Compare>
 bool lessThanOrEqual(const Compare& lessThan, const TableTuple tuple0, const TableTuple tuple1) {
     if (lessThan(tuple0, tuple1)) {
@@ -592,9 +499,10 @@ bool verifySortedTable(int64_t expectedTupleCount, LargeTempTable* table) {
     return true;
 }
 
-}
+} // end anonymous namespace
 
-TEST_F(LargeTempTableBlockTest, mergeSortedBlocks) {
+TEST_F(LargeTempTableBlockTest, sortLargeTempTable) {
+    using namespace std::chrono;
     UniqueEngine engine = UniqueEngineBuilder()
         .setTopend(std::unique_ptr<LargeTempTableTopend>(new LargeTempTableTopend()))
         .build();
@@ -604,119 +512,44 @@ TEST_F(LargeTempTableBlockTest, mergeSortedBlocks) {
     std::vector<std::string> names;
     names.push_back("strfld");
     for (int i = 1; i < schema->columnCount(); ++i) {
-        names.push_back(boost::lexical_cast<std::string>(i));
+        names.push_back(std::string("tiny") + boost::lexical_cast<std::string>(i));
     }
+
     auto ltt = makeUniqueTable(TableFactory::buildLargeTempTable("ltmp", schema, names));
 
-    StandAloneTupleStorage storage{schema};
-    TableTuple tupleToInsert = storage.tuple();
-    for (int i = 1; i < schema->columnCount(); ++i) {
-        tupleToInsert.setNValue(i, Tools::nvalueFromNative(int8_t(i)));
-    }
+    const int NUM_BLOCKS = 25;
 
-    std::cout << "Generating random data"; std::cout.flush();
-    const int NUM_INPUT_BLOCKS = 25;
+    std::cout << "Generating " << NUM_BLOCKS << " blocks of random data...";
+    std::cout.flush();
+
     int numOriginalTuples = 0;
-
-    while (ltt->allocatedBlockCount() < 2) {
-        tupleToInsert.setNValue(0, Tools::nvalueFromNative(generateRandomString(VARCHAR_LENGTH)));
-        ltt->insertTuple(tupleToInsert);
-        ++numOriginalTuples;
-    }
-
-    int64_t tuplesPerBlock = ltt->activeTupleCount() - 1;
-
-    int64_t tuplesToInsertThisBlock = tuplesPerBlock - 1;
-    for (int j = 0; j < NUM_INPUT_BLOCKS - 1; ++j) {
-        for (int64_t i = 1; i < tuplesPerBlock; ++i) {
-            tupleToInsert.setNValue(0, Tools::nvalueFromNative(generateRandomString(VARCHAR_LENGTH)));
-            ltt->insertTuple(tupleToInsert);
-            ++numOriginalTuples;
-        }
-
-        tuplesToInsertThisBlock = tuplesPerBlock;
-    }
-
-    ASSERT_EQ(NUM_INPUT_BLOCKS, ltt->allocatedBlockCount());
-
-    ltt->finishInserts();
-    std::cout << ". "; std::cout.flush();
-
-    // --------------------
-    // Input table complete
-    // Now sort it!!
-    // --------------------
-
-    std::cout << "Sorting..."; std::cout.flush();
-    auto startTime = std::chrono::high_resolution_clock::now();
-
-    // Sort each block and create a bunch of 1-block sort runs to be merged below
-    std::queue<LttSortRunPtr> sortRunQueue;
-    LTTBlockSorter<FirstFieldComparator> sorter{schema, FirstFieldComparator{}};
-    auto it = ltt->getBlockIds().begin();
-    while (it != ltt->getBlockIds().end()) {
-        int64_t blockId = *it;
-        it = ltt->disownBlock(it);
-        LargeTempTableBlock* block = lttBlockCache->fetchBlock(blockId);
-        sorter.sort(block->begin(), block->end());
-        lttBlockCache->invalidateStoredCopy(block);
+    for (int i = 0; i < NUM_BLOCKS; ++i) {
+        LargeTempTableBlock* block = lttBlockCache->getEmptyBlock(schema);
+        fillBlock(block);
+        numOriginalTuples += block->activeTupleCount();
         block->unpin();
-        LargeTempTable* table = TableFactory::buildCopiedLargeTempTable("ltbl", ltt.get());
-        table->inheritBlock(blockId);
-        LttSortRunPtr sortRun{new LttSortRun(table)};
-        sortRunQueue.push(sortRun);
+        ltt->inheritBlock(block->id());
     }
 
-    ASSERT_EQ(NUM_INPUT_BLOCKS, sortRunQueue.size());
+    TupleValueExpression tve{0, 0}; // table 0, field 0
+    std::vector<AbstractExpression*> keys{&tve};
+    std::vector<SortDirectionType> dirs{SORT_DIRECTION_TYPE_ASC};
+    AbstractExecutor::TupleComparer comparer{keys, dirs};
 
-    // Now merge single-block runs into longer runs, until there is just one left
+    std::cout << "sorting...";
+    std::cout.flush();
 
-    const int MERGE_FACTOR = 11;
-    while (sortRunQueue.size() != 1) {
-        typedef LttSortRunComparator<FirstFieldComparator> SRComparator;
-        typedef std::priority_queue<LttSortRunPtr, std::vector<LttSortRunPtr>, SRComparator> SortRunPriorityQueue;
-        SortRunPriorityQueue mergeHeap{SRComparator{FirstFieldComparator{}}};
+    auto startTime = high_resolution_clock::now();
 
-        int64_t expectedMergeOutputTupleCount = 0;
-        for (int i = 0; i < MERGE_FACTOR; ++i) {
-            if (sortRunQueue.empty()) {
-                break;
-            }
+    ltt->sort(comparer, -1, 0); // no limit (-1), no offset (0)
 
-            LttSortRunPtr run = sortRunQueue.front();
-            sortRunQueue.pop();
-            run->init();
-            expectedMergeOutputTupleCount += run->tupleCount();
-            mergeHeap.push(run);
-        }
-
-        LttSortRunPtr outputSortRun(new LttSortRun(TableFactory::buildCopiedLargeTempTable("ltbl", ltt.get())));
-        while (mergeHeap.size() > 0) {
-            LttSortRunPtr run = mergeHeap.top();
-            mergeHeap.pop();
-
-            outputSortRun->insertTuple(run->currentTuple());
-            bool stillMoreTuplesInSortRun = run->advance();
-            if (stillMoreTuplesInSortRun) {
-                mergeHeap.push(run);
-            }
-        }
-
-        outputSortRun->finishInserts();
-        sortRunQueue.push(outputSortRun);
-    }
-
-    auto endTime = std::chrono::high_resolution_clock::now();
-    auto totalSortDurationMicros = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
-    std::cout << "sorted " << numOriginalTuples << " tuples (" << NUM_INPUT_BLOCKS << " blocks) in "
+    auto endTime = high_resolution_clock::now();
+    auto totalSortDurationMicros = duration_cast<microseconds>(endTime - startTime);
+    std::cout << "sorted " << numOriginalTuples << " tuples in "
               << (totalSortDurationMicros.count() / 1000000.0) << " seconds. ";
 
-    auto lttOutput = makeUniqueTable(sortRunQueue.front()->releaseTable());
-    sortRunQueue.pop();
-    ASSERT_EQ(numOriginalTuples, lttOutput->activeTupleCount());
-    ASSERT_TRUE(verifySortedTable(numOriginalTuples, lttOutput.get()));
+    ASSERT_TRUE(verifySortedTable(numOriginalTuples, ltt.get()));
 }
-
 
 int main(int argc, char* argv[]) {
     int opt;
